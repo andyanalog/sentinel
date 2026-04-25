@@ -6,7 +6,7 @@ from sentinel.core.signals.base import BaseSignal, SignalContext
 from sentinel.models.evaluation import EvaluationRequest, SignalResult
 
 WINDOW_SECONDS = 10.0
-BURST_THRESHOLD = 15  # requests within window → suspicious
+BURST_THRESHOLD = 6  # requests within window → suspicious
 
 
 @dataclass
