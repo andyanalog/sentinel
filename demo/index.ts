@@ -50,27 +50,33 @@ app.set("trust proxy", true);
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const scored = trust.middleware();
-// Wrap the SDK middleware so every decision also broadcasts to SSE clients,
-// tagged by source (user button vs internal bot loop).
-const scoredWithTag: express.RequestHandler = (req, res, next) => {
-  scored(req, res, (err?: unknown) => {
-    if (err) return next(err as Error);
-    const s = evalOf(req);
-    if (s) {
-      const source: DecisionEvent["source"] =
-        (req.headers["x-sentinel-source"] as string) === "bot" ? "bot" : "user";
-      broadcast({
-        t: Date.now(),
-        ip: (req.ip ?? "?") as string,
-        score: s.score,
-        action: s.action,
-        fingerprint: s.fingerprint,
-        source,
-      });
-    }
-    next();
+const scoredRaw = trust.middleware();
+// SDK middleware is async — await it so we always run our broadcast,
+// including on BLOCK (where the SDK short-circuits with a 429 and never
+// invokes next()). req.sentinel is set by the SDK before that short-circuit.
+const scoredWithTag: express.RequestHandler = async (req, res, next) => {
+  let nextErr: unknown = undefined;
+  let nextWasCalled = false;
+  await (scoredRaw as unknown as (
+    r: express.Request, s: express.Response, n: (e?: unknown) => void,
+  ) => Promise<void>)(req, res, (err?: unknown) => {
+    nextWasCalled = true;
+    nextErr = err;
   });
+  const s = evalOf(req);
+  if (s) {
+    const source: DecisionEvent["source"] =
+      (req.headers["x-sentinel-source"] as string) === "bot" ? "bot" : "user";
+    broadcast({
+      t: Date.now(),
+      ip: (req.ip ?? "?") as string,
+      score: s.score,
+      action: s.action,
+      fingerprint: s.fingerprint,
+      source,
+    });
+  }
+  if (nextWasCalled) next(nextErr as Error | undefined);
 };
 
 // ── API ──
