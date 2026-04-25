@@ -1,0 +1,24 @@
+name: sentinel-contracts
+
+contracts_folder: .
+
+plugins:
+  - name: vyper
+
+default_ecosystem: ethereum
+
+compile:
+  exclude:
+    - ".venv/**"
+    - "tests/**"
+    - "deploy/**"
+    - "**/*.json"
+    - "**/*.md"
+    - "**/*.yaml"
+    - "**/*.yml"
+
+networks:
+  arc:
+    testnet:
+      host: ${ARC_RPC_URL}
+      chain_id: ${ARC_CHAIN_ID}

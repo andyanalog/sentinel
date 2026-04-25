@@ -1,0 +1,25 @@
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+.secrets/
+**/.secrets/
+node_modules/
+dist/
+build/
+# Ape compile output — leaks local user paths via embedded AST. Backend
+# ships its own sanitized ABI bundle at backend/sentinel/reputation/contract_abis.json.
+contracts/.build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.sqlite
+*.sqlite3
+.DS_Store
+BACKGROUND.md
+DEPLOYPLAN.md
