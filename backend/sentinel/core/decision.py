@@ -1,7 +1,7 @@
 from sentinel.models.evaluation import Action
 
 ALLOW_THRESHOLD = 40
-BLOCK_THRESHOLD = 65
+BLOCK_THRESHOLD = 55
 
 
 def decide(score: int) -> Action:

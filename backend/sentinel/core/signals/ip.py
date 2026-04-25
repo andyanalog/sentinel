@@ -9,7 +9,10 @@ from sentinel.models.evaluation import EvaluationRequest, SignalResult
 _SUSPICIOUS_PREFIXES = [
     "5.188.0.0/16",      # commonly abused hosting
     "45.95.0.0/16",
+    "45.134.0.0/16",     # commonly abused hosting
     "185.220.0.0/16",    # tor exits
+    "194.127.0.0/16",    # commonly abused hosting
+    "212.83.0.0/16",     # online.net
     "104.131.0.0/16",    # digitalocean
     "167.99.0.0/16",     # digitalocean
     "172.104.0.0/16",    # linode
