@@ -1,81 +1,177 @@
-# Sentinel — Trust-as-a-Service
+# Sentinel — Trust-as-a-Service for APIs
 
-Middleware trust evaluation service. Any API calls `/v1/evaluate` per request for an ALLOW / CHALLENGE / BLOCK signal. Operators pay per evaluation via Circle Nanopayments (x402 / Gateway) on Arc L1. Reputation accumulates onchain across every integrated app.
+One line of middleware. Every request scored in real time as **ALLOW**, **CHALLENGE**, or **BLOCK**. Reputation written onchain so it's verifiable and portable across every integrated app.
 
-See [PLAN.md](./PLAN.md) for full architecture and [REFERENCE.md](./REFERENCE.md) for the SDK and HTTP API reference.
+## Live demo
 
-## What it is (and what it isn't)
+| | URL |
+|---|---|
+| Visual demo (try it) | https://demo-production-ccb5.up.railway.app/ |
+| Backend API | https://sentinel-demo.up.railway.app/ |
+| `ReputationLedger` on Arc testnet | [`0x92292B00…`](https://testnet.arcscan.app/address/0x92292B00e76Bf8022b15D79CC8F85766cCA289A0?tab=index) |
+| `OperatorPool` on Arc testnet | [`0x10504B3F…`](https://testnet.arcscan.app/address/0x10504B3F4B5f172a88C34570Ab8E91aEb3bD9B63?tab=index) |
 
-**What it does.** On every request that hits your API, Sentinel derives a *fingerprint* (a hash of IP + ASN + user-agent + selected headers) and a *score* (0–100) from behavioral signals — request cadence, endpoint diversity, error rate, IP reputation, and cross-operator history. That score maps to `ALLOW` / `CHALLENGE` / `BLOCK`. The fingerprint's running reputation is stored across three tiers: Redis for hot/burst state, Postgres for recent samples, and the Arc L1 `ReputationLedger` contract for the durable, cross-operator EMA (70% prior + 30% new, batched — not written per request). When a different operator later evaluates the same fingerprint, the onchain prior is read back as the heaviest signal (`reputation`, weight 1.5). That's the mechanism behind "flagged on one API = flagged everywhere."
+Click "Send normal request" to score legitimate traffic; click "Simulate bot attack" to fire 30 req/s for 10 s and watch the verdict flip ALLOW → CHALLENGE → BLOCK in real time. The "View on chain" button opens the contract that stores fingerprints we've evaluated.
 
-**What it is not.** It does **not** store the request payload, headers, or any PII onchain — only fingerprint hashes and numeric scores. It is **not** a user-identity or KYC system; it never sees the logged-in user and intentionally excludes cookies/bearer tokens from the fingerprint so it survives logout and catches shared credentials. It is **not** a WAF or DDoS edge — put it behind Cloudflare, not in front of it. It is **not** a CAPTCHA replacement on its own; `CHALLENGE` is a hint that *your* app should route to a captcha, email verification, or slow path. It is **not** a deterministic rule engine — two identical requests can score differently as the cross-operator reputation evolves, which is the point.
+## Stack
+
+**Backend** — Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2 (async), Alembic, structlog. Postgres for warm storage, Redis for hot counters. Run via uvicorn or Docker.
+
+**SDK** — TypeScript, distributed as a `file:` workspace dep. Adapters for Express, Fastify, and Hono. One async middleware that calls `/v1/evaluate` per request and short-circuits 429 on BLOCK.
+
+**Demo app** — Express + tsx, single-page UI with Server-Sent Events for the live decision feed. Self-contained "bot loop" that fires synthetic traffic so judges don't need a shell to trigger an attack.
+
+**Smart contracts** — Vyper, deployed with Ape framework on Arc L1 testnet:
+
+- `ReputationLedger` — `write_batch(records[])` writes batched fingerprint scores (one tx per N evals). Public reads via `get_record(fingerprint)`.
+- `OperatorPool` — `deposit(operator_id, amount)` for funding, `debit(operator_id, amount)` for per-eval billing in USDC.
+
+**Payments** — **Circle USDC** on Arc L1 (USDC contract `0x36000000…`). Settlement model = **Circle Nanopayments / x402 / Gateway** style: each evaluation debits a fraction of a cent from the operator's pool balance; debits are batched onchain so gas stays bounded. No invoices, no monthly minimum — the contract balance is the bill.
+
+**Chain** — Arc L1 testnet (chain ID `5042002`, RPC `https://rpc.testnet.arc.network`). web3.py + eth_account for tx signing inside the backend; the operator wallet is funded via faucet for gas.
+
+**Hosting** — Railway (backend, demo, Postgres, Redis). Vercel for frontend.
+
+## Quickstart — local, dummy mode (no chain, no DB)
+
+The fastest way to see Sentinel work end-to-end. Dummy mode swaps in in-memory adapters for cache, store, ledger, and payments — no Postgres, no Redis, no testnet wallet.
+
+```bash
+# 1. Backend
+cd backend
+pip install -e .
+SENTINEL_DUMMY=true uvicorn sentinel.main:app --reload --port 8000
+
+# 2. Demo app (separate terminal)
+cd demo && npm install
+SENTINEL_ENDPOINT=http://localhost:8000 npx tsx index.ts
+```
+
+Open `http://localhost:3000`, click around. Backend health: `curl localhost:8000/health` → `{"status":"ok","dummy_mode":true}`.
+
+## Quickstart — local, full mode (Postgres + Redis)
+
+```bash
+docker-compose up -d postgres redis     # bring up sibling stores
+cd backend
+cp .env.example .env                    # fill in Arc + wallet vars (see below)
+alembic upgrade head                    # create tables
+uvicorn sentinel.main:app --port 8000   # SENTINEL_DUMMY unset → real adapters
+```
+
+Required `backend/.env` keys for full mode (already populated from Arc testnet deploy):
+
+```
+DATABASE_URL=postgresql+asyncpg://sentinel:sentinel@localhost:5432/sentinel
+REDIS_URL=redis://localhost:6379/0
+ARC_RPC_URL=https://rpc.testnet.arc.network
+ARC_CHAIN_ID=5042002
+REPUTATION_LEDGER_ADDRESS=0x92292B00e76Bf8022b15D79CC8F85766cCA289A0
+OPERATOR_POOL_ADDRESS=0x10504B3F4B5f172a88C34570Ab8E91aEb3bD9B63
+ARC_USDC_ADDRESS=0x3600000000000000000000000000000000000000
+SENTINEL_WALLET_PRIVATE_KEY=…           # service wallet, testnet only
+```
+
+## End-to-end testing on real testnet
+
+Three scripts under `backend/scripts/` exercise the full Arc-side pipeline. All assume `.secrets/testnet_deployment.json` and `.secrets/sentinel_service_key.json` exist (created by `deploy_testnet.py`).
+
+```bash
+cd backend
+export SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")
+export PYTHONPATH=.
+
+# 1. Single end-to-end loop: card → pool credit → 20 evals → flush → balance check
+#    Proves CirclePayments + PoolManager work against the live OperatorPool.
+python scripts/testnet_e2e_demo.py
+
+# 2. Seed N rounds of OperatorPool activity (one deposit + one batched debit per round)
+#    Default 25 rounds = ~50 onchain txs. Useful for populating the contract before judging.
+python scripts/seed_chain.py 25
+
+# 3. Seed N batched fingerprint writes to ReputationLedger
+#    Default 30 rounds × 3 signals each = 30 write_batch txs (90 fingerprints).
+python scripts/seed_ledger.py 50 3
+```
+
+After running, the contracts will show fresh activity at the explorer URLs in the table above.
+
+To replay end-to-end **through the deployed backend** (so a real `/api/submit` from the demo writes to chain):
+
+```bash
+# unset SENTINEL_DUMMY, start backend, fire requests
+unset SENTINEL_DUMMY
+uvicorn sentinel.main:app --port 8000 &
+curl -X POST localhost:8000/v1/operators -H content-type:application/json -d '{"name":"e2e"}'
+# response gives you {operator: {api_key: "sk_..."}, pool: {...}}
+# fund the pool, then submit through the SDK:
+SENTINEL_ENDPOINT=http://localhost:8000 SENTINEL_API_KEY=sk_... npx tsx demo/index.ts
+```
+
+The `LedgerBatchWorker` flushes accumulated signals every `LEDGER_BATCH_INTERVAL` seconds; the `PoolDebitWorker` settles debits every `POOL_DEBIT_INTERVAL` seconds. Default 60s / 30s — drop to ~10s during demos.
+
+## What it does
+
+On every request hitting your API, Sentinel derives a **fingerprint** (a hash of IP + ASN + user-agent + selected headers) and a **score** (0–100) from five behavioral signals — request cadence, endpoint diversity, error rate, IP reputation, and cross-operator history.
+
+The score maps to `ALLOW` (<40) / `CHALLENGE` (40–54) / `BLOCK` (≥55). The fingerprint's running reputation is stored across three tiers:
+
+- **Hot** — Redis, per-fingerprint counters and short-lived score cache.
+- **Warm** — Postgres, recent fingerprint records with EMA-smoothed scores (70% prior + 30% new).
+- **Cold** — Arc L1 `ReputationLedger`, batched onchain writes for durable, cross-operator state.
+
+When a different operator later evaluates the same fingerprint, the onchain prior is read back as the heaviest signal (`reputation`, weight 1.5). That's the mechanism behind "flagged on one API = flagged everywhere."
+
+## What it is not
+
+- It does **not** store payloads, headers, or PII onchain — only fingerprint hashes and numeric scores.
+- It is **not** an identity / KYC system; it never sees the logged-in user and excludes cookies / bearer tokens from the fingerprint so it survives logout and catches shared credentials.
+- It is **not** a WAF or DDoS edge — put it behind Cloudflare, not in front of it.
+- It is **not** a CAPTCHA replacement; `CHALLENGE` is a hint that *your* app should route to a captcha, email verification, or slow path.
+- It is **not** a deterministic rule engine — two identical requests can score differently as cross-operator reputation evolves, which is the point.
 
 ## Core value props
 
-- **Pay-per-call.** No monthly seat fee, no minimum. Scales to zero for a side project; scales linearly under a credential-stuffing spike. Settled in USDC via Circle Nanopayments (x402) so a $9/mo floor never blocks integration.
-- **Blockchain abstracted away from the developer.** You never touch a wallet, a chain ID, or a gas estimator. Top up the operator pool with a card, ACH, or USDC — or pre-pay a monthly budget and let the per-call debit draw it down. The onchain ledger is an implementation detail; the integration surface is one HTTP call and one API key. Crypto is how we settle and how reputation becomes portable; it is not a requirement to use the product.
-- **Cross-app reputation (built for developers).** The primary audience is builders — anyone shipping an API, signup flow, or LLM endpoint. You inherit the collective knowledge of every other integrator: bad IPs, abusive fingerprints, and scraper patterns that have already burned reputation elsewhere. A solo founder on day one gets the same signal quality as a funded company that's been integrated for a year.
-- **Cross-app reputation (the mechanism).** A fingerprint flagged on one integrated API is flagged on all of them. The bad actor hitting your signup endpoint this morning already burned their reputation on someone else's login endpoint last night — you inherit that signal for free.
-- **One-liner SDK.** `app.use(sentinel({ apiKey }))` for Express / Fastify / Hono. Returns 429 on BLOCK, attaches `req.sentinel` for CHALLENGE routing. No SDK lock-in — it's a thin wrapper over one HTTP call.
+- **Pay-per-call.** No monthly seat fee, no minimum. Scales to zero for a side project; scales linearly under a credential-stuffing spike. Settled in USDC via Circle Nanopayments so a $9/mo floor never blocks integration.
+- **Blockchain abstracted from the developer.** You never touch a wallet, a chain ID, or a gas estimator. Top up the operator pool with a card or USDC; per-call debits draw it down. Crypto is how we settle and how reputation becomes portable — not a requirement to use the product.
+- **Cross-app reputation.** A fingerprint flagged on one integrated API is flagged on all of them. A solo founder on day one inherits the same signal quality as a funded company a year in.
+- **One-liner SDK.** `app.use(sentinel({ apiKey }))` for Express / Fastify / Hono. Returns 429 on BLOCK, attaches `req.sentinel` for CHALLENGE routing.
 
-### A note on rotating IPs
+## A note on rotating IPs
 
-Consumer residential IPs rotate every 24–48 hours, and this does produce a new fingerprint. It's a real limitation, handled with layered defenses rather than a silver bullet:
+Consumer residential IPs rotate every 24–48 hours, producing a new fingerprint. Real limitation, handled with layered defenses:
 
-- **ASN reputation survives the rotation.** When the IP flips from `203.0.113.42` to `203.0.113.189` on the same ISP, the ASN stays the same — and the `ip_asn` signal and a coarser ASN-level reputation prior still fire.
-- **Behavioral signals catch the new fingerprint fast.** Cadence and endpoint-diversity signals don't need history; the first burst from a new fingerprint is enough to trigger CHALLENGE within seconds.
-- **Non-IP components are sticky.** User-agent, accept-language, and header ordering tend to persist across IP rotations from the same device, so the fingerprint isn't purely IP-derived.
-- **The system is probabilistic, not a bouncer.** The goal is to raise the cost of abuse, not to make a perfect decision on request 1. A rotating-IP attacker pays in friction every 24h; a legitimate user on a rotating IP lands back in ALLOW after one or two low-risk requests.
+- **ASN reputation survives the rotation** — same ISP, same ASN, same coarser prior.
+- **Behavioral signals catch the new fingerprint fast** — cadence + endpoint diversity don't need history.
+- **Non-IP components are sticky** — UA, accept-language, header ordering tend to persist across rotations from the same device.
+- **The system is probabilistic, not a bouncer** — goal is to raise the cost of abuse, not make a perfect decision on request 1.
 
-For sophisticated attackers using residential-proxy networks that rotate per-request, the roadmap adds TLS JA4 fingerprinting and (browser-client only) canvas/WebGL signals. Those close the gap but can't be applied to pure API traffic.
+For sophisticated attackers using residential-proxy networks that rotate per-request, the roadmap adds TLS JA4 fingerprinting and (browser-only) canvas/WebGL signals.
 
 ## Real-world scenarios
 
-**Signup / registration endpoints fighting fake account farms.**
-The classic fraud surface. Incumbent answer is Cloudflare Turnstile or hCaptcha — widgets that fire once at form submit and can't see behavior across your other routes. Sentinel evaluates every request, carries reputation across endpoints (signup → first login → first write), and costs cents per thousand instead of a Turnstile Enterprise contract. Better fit when your abuse signal shows up *after* signup (e.g. burst API calls from a newly-created account).
-
-**LLM / AI inference APIs under scraper and token-farming pressure.**
-OpenAI-wrapper products get hammered by actors cycling free-tier keys to resell inference. Rate-limiting by API key is trivially bypassed; rate-limiting by IP punishes legitimate shared-NAT users. Sentinel fingerprints across key+IP+ASN+cadence and shares the reputation with every other LLM wrapper on the network — a scraper burning through free tiers on competitor A is pre-flagged when it hits you. Cloudflare Bot Management can do per-site rate limits but not cross-tenant reputation.
-
-**Login endpoints defending against credential stuffing.**
-Auth0/Okta anomaly detection and Stytch device intelligence work, but they're priced for enterprise SSO ($0.02–$0.25 per MAU) and only see *your* tenant's traffic. Sentinel sees the same credential-stuffing botnet hitting a dozen other login endpoints simultaneously and blocks it on request 1, not request 100. Pay-per-eval pricing means a hobbyist auth flow can afford the same signal quality as a funded startup.
-
-**Free-tier abuse on SaaS and developer APIs.**
-Image generation, email sending, code execution sandboxes — anywhere "free tier" means "unit economics depend on abuse staying below X%." Castle.io and Arkose Labs solve this but require 6-figure ACVs and enterprise sales cycles. Sentinel gives you the same ALLOW/CHALLENGE/BLOCK decision for a fraction of a cent per call with an afternoon of integration.
-
-**Review, comment, and UGC spam.**
-Akismet works for WordPress-shaped content but is blind to the upstream request pattern (same fingerprint posting to ten unrelated sites in a minute). Sentinel's cross-app signal catches coordinated spam rings before the content-level classifier sees the payload, which is strictly cheaper than running an LLM moderation pass on garbage.
-
-**Crypto faucets, airdrop claims, and quest platforms.**
-Sybil resistance is the entire product requirement. Gitcoin Passport and Worldcoin solve identity but require the user to actively enroll; most faucet users won't. Sentinel runs silently in the request path, flags the same wallet-farming fingerprint across every faucet on the network, and settles its own fees in the same USDC the faucet is already handling. Natural fit: onchain product, onchain payment rail, onchain reputation ledger.
-
-## Quickstart (dummy mode — no external deps)
-
-```bash
-# backend
-cd backend
-pip install -e .
-uvicorn sentinel.main:app --reload --host 0.0.0.0 --port 8000 -- --dummy
-# or: SENTINEL_DUMMY=true uvicorn sentinel.main:app --reload
-
-# demo app
-cd demo && npm install && npx tsx index.ts
-
-# bot simulator
-npx tsx demo/bot.ts --target=http://localhost:3000 --rps=20
-```
-
-## Full mode
-
-```bash
-docker-compose up -d          # postgres + redis
-cd backend && alembic upgrade head
-uvicorn sentinel.main:app --host 0.0.0.0 --port 8000
-```
+- **Signup endpoints fighting fake account farms** — sees behavior across signup → first login → first write, not just at the form widget.
+- **LLM / AI inference APIs under scraper pressure** — fingerprints across key+IP+ASN+cadence; cross-tenant reputation that Cloudflare Bot Management can't do.
+- **Login endpoints defending credential stuffing** — sees the same botnet hitting other login endpoints; blocks on request 1 not request 100.
+- **Free-tier abuse on SaaS / dev APIs** — Castle.io / Arkose-class signal at fractions of a cent per call, no enterprise sales cycle.
+- **Review / comment / UGC spam** — catches coordinated rings before content-level classifiers run.
+- **Crypto faucets, airdrop claims, quest platforms** — onchain product + onchain payment rail + onchain reputation ledger.
 
 ## Layout
 
-- `backend/` — FastAPI evaluation engine
-- `sdk/` — TypeScript SDK (Express / Fastify / Hono)
-- `demo/` — demo Express app + bot simulator
-- `contracts/` — Vyper contracts for Arc L1
+```
+backend/        FastAPI evaluation engine + workers + alembic migrations
+  scripts/      testnet seeders + e2e demo (testnet_e2e_demo.py, seed_chain.py, seed_ledger.py)
+sdk/            TypeScript SDK (Express / Fastify / Hono adapters)
+demo/           Express demo app + visual UI + bot simulator
+dashboard/      Operator dashboard (Vite + React)
+frontend/       Marketing site (Vite + React)
+contracts/      Vyper contracts (ReputationLedger, OperatorPool, MockERC20)
+```
+
+## Further reading
+
+- [PLAN.md](./PLAN.md) — full architecture
+- [REFERENCE.md](./REFERENCE.md) — SDK + HTTP API reference
+- [HOWTO.md](./HOWTO.md) — task-oriented recipes
+- [contracts/README.md](./contracts/README.md) — contract addresses + Ape commands
